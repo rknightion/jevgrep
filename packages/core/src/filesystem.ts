@@ -325,6 +325,7 @@ export async function createFilesystem(options: FilesystemOptions) {
           filesystemDefaults.dependencyDirectories.includes(name)
         )
           return excluded("dependency");
+        if (stat.isDirectory() && (await isWorktree(absolute))) return excluded("worktree");
         let ignored = false;
         for (const scope of scopes) {
           const candidate =
@@ -487,3 +488,31 @@ export async function createFilesystem(options: FilesystemOptions) {
   return { root, readSnapshot, lookupFile, listPage, closeCursor: discard, close };
 }
 export type FilesystemReader = Awaited<ReturnType<typeof createFilesystem>>;
+
+/**
+ * A linked git worktree is another checkout of a repository, often one already under search
+ * (agent loops park them inside the repository), so its files would duplicate the source and
+ * multiply the search. Its .git file points into the main repository's .git/worktrees/.
+ * Submodules and nested clones are still searched; a search rooted in a worktree reads it.
+ */
+async function isWorktree(directory: string) {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    // Bounded and non-blocking, like every other read here: the marker may be swapped.
+    handle = await open(
+      join(directory, ".git"),
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > 4096) return false;
+    const buffer = Buffer.alloc(4096);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const gitdir = /^gitdir:\s*(.+?)\s*$/m.exec(text)?.[1];
+    return gitdir !== undefined && /[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir);
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}

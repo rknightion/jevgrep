@@ -80,6 +80,36 @@ test("closer ignore rules and same-scope .ignore overrides apply, while excluded
   }
 });
 
+test("nested git worktrees are skipped, while submodules and a worktree root are searched", async () => {
+  const root = await fixture({
+    "src.ts": "source",
+    "copy/.git": "gitdir: /repo/.git/worktrees/copy\n",
+    "copy/src.ts": "another checkout of the same repository",
+    "third/lib/.git": "gitdir: ../../.git/modules/lib\n",
+    "third/lib/lib.ts": "submodule source",
+  });
+  const reader = await createFilesystem({ root });
+  try {
+    expect(await reader.readSnapshot("copy/src.ts")).toMatchObject({
+      status: "excluded",
+      reason: "worktree",
+    });
+    expect(await reader.readSnapshot("third/lib/lib.ts")).toMatchObject({ status: "ok" });
+    const page = await reader.listPage(".");
+    expect(page.entries.map((entry) => entry.path).sort()).toEqual(["src.ts", "third"]);
+  } finally {
+    await reader.close();
+  }
+  // A search rooted inside a worktree still reads it.
+  await writeFile(join(root, "copy", "extra.ts"), "worktree source");
+  const inside = await createFilesystem({ root: join(root, "copy") });
+  try {
+    expect(await inside.readSnapshot("extra.ts")).toMatchObject({ status: "ok" });
+  } finally {
+    await inside.close();
+  }
+});
+
 test("pages advance past excluded entries, preserve unusual names, and release completed cursors", async () => {
   const root = await fixture({
     ".gitignore": "skip*\n",
