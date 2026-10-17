@@ -7,6 +7,7 @@ import {
   type CredentialProvider,
 } from "./providers";
 import { type createEvaluationCache, type CacheInput } from "./cache";
+import { createProviderFetch } from "./provider-fetch";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import { createRateBudget, estimatedInputTokens } from "./rate-budget";
@@ -47,6 +48,7 @@ export function createEvaluator(options: {
   concurrency?: number;
 }) {
   const endpoint = endpointFor(options);
+  const transport = options.fetch ?? createProviderFetch();
   const cloudflareRoute =
     options.provider === cloudflareProviderId ? cloudflareRunURL(endpoint.baseURL) : undefined;
   const concurrency = options.concurrency ?? 32;
@@ -94,7 +96,6 @@ export function createEvaluator(options: {
       if (requests >= (options.requestLimit ?? 50_000))
         throw new EvaluationFailure("request-limit");
       requests++;
-      const transport = options.fetch ?? fetch;
       const response = cloudflareRoute
         ? await cloudflareTransport(transport, cloudflareRoute, init)
         : await transport(input, init);

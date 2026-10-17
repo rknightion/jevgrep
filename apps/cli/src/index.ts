@@ -8,6 +8,7 @@ import { renderInventory, renderResult } from "./render";
 import { stat } from "node:fs/promises";
 import { version } from "../package.json";
 import { installSkill } from "./skill";
+import { startWatchdog } from "./watchdog";
 
 globalThis.AI_SDK_LOG_WARNINGS = false;
 
@@ -33,6 +34,7 @@ async function write(text: string) {
 }
 
 async function main() {
+  startWatchdog();
   const command = parseCommand(process.argv.slice(2));
   switch (command.kind) {
     case "help":
