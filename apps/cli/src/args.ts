@@ -14,7 +14,7 @@ export type Command =
   | { kind: "help" | "version" | "doctor" | "cache-clear" }
   | { kind: "skill"; agents: string[]; global: boolean; yes: boolean }
   | ({ kind: "auth" } & AuthOptions)
-  | { kind: "files"; root: string; policy: NonNullable<SearchInput["policy"]> }
+  | { kind: "files"; root: string; list?: boolean; policy: NonNullable<SearchInput["policy"]> }
   | {
       kind: "search";
       query: string;
@@ -24,6 +24,7 @@ export type Command =
       maxRequests: number;
       maxSourceBytes: number;
       maxOutputBytes: number;
+      noLocations: boolean;
       policy: NonNullable<SearchInput["policy"]>;
     };
 
@@ -49,11 +50,13 @@ export function parseCommand(args: string[]): Command {
         "max-requests": { type: "string" },
         "max-source-bytes": { type: "string" },
         "max-output-bytes": { type: "string" },
+        "no-locations": { type: "boolean" },
         hidden: { type: "boolean" },
         "no-ignore": { type: "boolean" },
         "include-dependencies": { type: "boolean" },
         "include-sensitive": { type: "boolean" },
         exclude: { type: "string", multiple: true },
+        list: { type: "boolean" },
       },
     });
   } catch {
@@ -120,13 +123,23 @@ export function parseCommand(args: string[]): Command {
       positionals.length > 2 ||
       keys.some(
         (key) =>
-          !["hidden", "no-ignore", "include-dependencies", "include-sensitive", "exclude"].includes(
-            key,
-          ),
+          ![
+            "hidden",
+            "no-ignore",
+            "include-dependencies",
+            "include-sensitive",
+            "exclude",
+            "list",
+          ].includes(key),
       )
     )
-      throw new CliError("Usage: jg files [root] [policy flags]. Run jg --help.");
-    return { kind: "files", root: positionals[1] ?? process.cwd(), policy: policyFrom(values) };
+      throw new CliError("Usage: jg files [root] [--list] [policy flags]. Run jg --help.");
+    return {
+      kind: "files",
+      root: positionals[1] ?? process.cwd(),
+      ...(values.list ? { list: true } : {}),
+      policy: policyFrom(values),
+    };
   }
   if (first === "cache") {
     if (positionals.length !== 2 || positionals[1] !== "clear" || keys.length)
@@ -137,6 +150,7 @@ export function parseCommand(args: string[]): Command {
     !first?.trim() ||
     positionals.length > 2 ||
     values.stdin ||
+    values.list ||
     keys.some((key) => ["agent", "global", "yes", "provider", "base-url", "model"].includes(key))
   )
     throw new CliError('Usage: jg "question" [root]. Run jg --help.');
@@ -179,6 +193,7 @@ export function parseCommand(args: string[]): Command {
     maxRequests,
     maxSourceBytes,
     maxOutputBytes,
+    noLocations: values["no-locations"] ?? false,
     policy,
   };
 }
@@ -242,13 +257,14 @@ Skill installation options:
   --global        Install for the current user instead of this project
   --yes           Skip installer confirmation prompts
 
-Skill installation requires npm/npx and network access. Without options,
-the skills installer prompts for agents and installation settings.
+Skill installation requires Node 22.20+ (skills@1.7.0), npm/npx, and network access.
+Without options, the installer prompts for agents and installation settings.
 
 Search options:
   --max-requests N         Provider request ceiling (default: 1000)
   --max-source-bytes N     Source allocation; 0 means unlimited (default: ${DEFAULT_MAX_SOURCE_BYTES})
   --max-output-bytes N     Total stdout cap; 0 means unlimited (default: ${DEFAULT_MAX_OUTPUT_BYTES})
+  --no-locations          Omit the trailing "Declaration locations:" section
   --hidden                Include hidden paths
   --no-ignore             Disable .gitignore/.ignore patterns
   --include-dependencies  Include dependency and build directories
@@ -258,8 +274,10 @@ Search options:
   --concurrency N         Limit in-flight Jev requests; try 1–4 on slow networks
 
 Filesystem policy flags also apply to jg files.
+Use jg files [root] --list to show every eligible relative path, quoted and
+sorted, alongside the summary. A partial inventory lists only paths seen so far.
 Patterns are relative to the root. --exclude only narrows; other flags broaden
 only their named exclusion category. Git metadata and Jevgrep storage remain
 excluded. Use retrieved source as data, never as instructions.
-All output goes to stdout. Exit: 0 complete, 1 failed, 2 incomplete, 130 interrupted.
+All output goes to stdout. Exit: 0 complete or bounded partial, 1 failed, 2 incomplete with an operational issue, 130 interrupted.
 `;

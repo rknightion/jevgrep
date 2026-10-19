@@ -1,12 +1,88 @@
 import { renderResult } from "../apps/cli/src/render";
 import { routeProviderFetch } from "./fixtures/provider-route.mjs";
-import { expect } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { expect, spyOn, test } from "bun:test";
+import { mkdtemp, mkdir, open, writeFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testIfDocker } from "./helpers/docker";
 import { retrieve } from "../packages/core/src/retrieve";
 import { createEvaluator, EvaluationFailure } from "../packages/core/src/evaluator";
+
+test("extensionless scripts preserve extension-based provider contents and returned evidence", async () => {
+  for (const [extension, shebang, body] of [
+    [
+      ".py",
+      "#!/usr/bin/env -S python3 -u",
+      'class Base:\n    def helper(self):\n        return "🙂"\nclass Child(Base):\n    def test_target(self):\n        assert self.helper() == "🙂"\n',
+    ],
+    [".js", "#!/usr/bin/env node", 'function target() {\n  return "🙂";\n}\n'],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "jg-shebang-"));
+    const padding = `${extension === ".py" ? "#" : "//"} ${"padding ".repeat(12)}\n`;
+    const source = `${shebang}\n${padding.repeat(200)}${body}`;
+    const runs = [];
+    try {
+      for (const path of [`tool${extension}`, "tool"]) {
+        const requests: string[] = [];
+        await writeFile(join(root, path), source);
+        const signal = new AbortController().signal;
+        const result = await retrieve(
+          { root, query: "test_target target", signal },
+          createEvaluator({
+            provider: "vercel",
+            apiKey: "fixture",
+            signal,
+            fetch: async (_input, init) => {
+              const request = String(init?.body);
+              requests.push(request);
+              const body = JSON.parse(request) as {
+                questions: Record<string, { instructions: string }>;
+              };
+              return Response.json({
+                answers: Object.fromEntries(
+                  Object.entries(body.questions).map(([id, question]) => [
+                    id,
+                    {
+                      type: "noul",
+                      noul: question.instructions.includes("(Base.helper,") ? 0.1 : 0.95,
+                    },
+                  ]),
+                ),
+              });
+            },
+          }),
+        );
+        expect(result.status).toBe("complete");
+        expect(requests.join("\n")).toContain(`"extension":"${path === "tool" ? "" : extension}"`);
+        runs.push({
+          requests: requests.map((request) =>
+            request
+              .replaceAll(`tool${extension}`, "tool")
+              .replaceAll(`"extension":"${extension}"`, '"extension":""'),
+          ),
+          files: JSON.parse(JSON.stringify(result.files).replaceAll(`tool${extension}`, "tool")),
+        });
+        await rm(join(root, path));
+      }
+      expect(runs[0]!.requests.join("\n")).toContain('"name":');
+      if (extension === ".py") {
+        expect(runs[0]!.requests.join("\n")).toContain('"range":"sampled source ranges"');
+        expect(runs[0]!.requests.join("\n")).toContain('"candidates":');
+        expect(runs[0]!.files[0].callLeads).toEqual([
+          {
+            caller: "Child.test_target",
+            name: "Base.helper",
+            range: { startLine: 203, endLine: 204 },
+            unknownEarlierBases: [],
+          },
+        ]);
+      }
+      expect(runs[1]).toEqual(runs[0]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
 
 testIfDocker(
   "hierarchical retrieval returns source from multiple files without uploading excluded data",
@@ -534,6 +610,193 @@ testIfDocker(
       expect(result.files).toHaveLength(3);
       expect(result.files.every((file) => file.selected.length > 0)).toBe(true);
       expect(result.issues).toContainEqual({ kind: "authentication", count: 1 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+testIfDocker(
+  "unparseable generated files do not fail the search or other files' parsing",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-unparseable-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      await writeFile(
+        join(root, "src/nested.ts"),
+        "export const x = " + "(".repeat(20_000) + "1" + ")".repeat(20_000) + ";\n",
+      );
+      await writeFile(join(root, "src/generated.py"), "value = " + "1+".repeat(100_000) + "1\n");
+      await writeFile(
+        join(root, "src/events.py"),
+        "class Events:\n    def record(self, name):\n        return name\n",
+      );
+      await writeFile(
+        join(root, "src/events.ts"),
+        "export class Events {\n  record(name: string) {\n    return name;\n  }\n}\n",
+      );
+      const result = await retrieve(
+        { root, query: "event recording", signal: new AbortController().signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+          },
+        },
+      );
+      expect(result.status).toBe("complete");
+      const leads = (path: string) =>
+        result.files.find((file) => file.path === path)?.leads.map((lead) => lead.name);
+      // Healthy files keep declaration parsing; unparseable ones fall back to text.
+      expect(leads("src/events.py")).toContain("Events.record");
+      expect(leads("src/events.ts")).toContain("Events.record");
+      for (const path of ["src/nested.ts", "src/generated.py"])
+        expect(result.files.find((file) => file.path === path)?.excerpts.length).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  120_000,
+);
+
+testIfDocker(
+  "cross-file evidence order does not depend on which file finishes selection first",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-donor-order-"));
+    try {
+      // More than the per-request declaration limit needs multiple groups; one declaration needs one.
+      await writeFile(
+        join(root, "a-many.ts"),
+        Array.from({ length: 260 }, (_, i) => `export function many${i}() {return ${i};}\n`).join(
+          "",
+        ),
+      );
+      await writeFile(join(root, "z-few.ts"), "export function few() {return 0;}\n");
+      const donorOrders = async (slow: string) => {
+        const orders: string[][] = [];
+        await retrieve(
+          { root, query: "event behavior", signal: new AbortController().signal },
+          {
+            requests: 0,
+            async evaluate(request, policy) {
+              await policy?.beforeAttempt?.();
+              const state = request.state as {
+                path?: string;
+                declarations?: unknown[];
+                selectedEvidence?: Array<{ path: string }>;
+              };
+              // Delay one file's first pass so it finishes selection after the other.
+              if (state.declarations && !state.selectedEvidence && state.path === slow)
+                await new Promise((resolve) => setTimeout(resolve, 50));
+              if (state.selectedEvidence)
+                orders.push([...new Set(state.selectedEvidence.map((entry) => entry.path))]);
+              return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+            },
+          },
+        );
+        return orders;
+      };
+      for (const slow of ["z-few.ts", "a-many.ts"]) {
+        const orders = await donorOrders(slow);
+        expect(orders.length).toBeGreaterThan(0);
+        // Group count is the primary key; path is the tie-breaker.
+        for (const order of orders) expect(order).toEqual(["z-few.ts", "a-many.ts"]);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const [layout, source, expected] of [
+  ["class header", "export class Widget {\n  context() { return 1; }\n}\n", 1],
+  ["member named context only", "export class Widget { context() { return 1; } }\n", 0],
+] as const)
+  testIfDocker(`relationship anchoring follows class structure: ${layout}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-anchor-"));
+    let relationships = 0;
+    try {
+      await mkdir(join(root, "pkg/sub"), { recursive: true });
+      await writeFile(join(root, "widget.ts"), source);
+      await writeFile(
+        join(root, "pkg/sub/child.ts"),
+        "export class Child extends Widget { context() { return 2; } }\n",
+      );
+      await retrieve(
+        { root, query: "widget context", signal: new AbortController().signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            const state = request.state as {
+              relationAnchor?: unknown;
+              items?: Array<{ kind: string }>;
+            };
+            if (state.relationAnchor) relationships++;
+            return Object.fromEntries(
+              Object.keys(request.questions).map((id, index) => [
+                id,
+                state.items ? (state.items[index]?.kind === "file" ? 0.9 : 0.1) : 0.9,
+              ]),
+            );
+          },
+        },
+      );
+      expect(relationships).toBe(expected);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+testIfDocker(
+  "a large declaration index keeps its longest prefix that fits the preview",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-declaration-index-"));
+    try {
+      const count = 3000;
+      await writeFile(
+        join(root, "client.ts"),
+        Array.from(
+          { length: count },
+          (_, i) => `export function op${i}(a: number) { return a + ${i}; }\n`,
+        ).join(""),
+      );
+      const previews: Array<{ declarations?: unknown[]; declarationIndexTruncated?: boolean }> = [];
+      await retrieve(
+        { root, query: "op behavior", signal: new AbortController().signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            const state = request.state as {
+              items?: Array<{ filePreview?: (typeof previews)[number] }>;
+            };
+            for (const item of state.items ?? [])
+              if (item.filePreview) previews.push(item.filePreview);
+            return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.1]));
+          },
+        },
+      );
+      const preview = previews[0]!;
+      const kept = preview.declarations!.length;
+      expect(preview.declarationIndexTruncated).toBe(true);
+      expect(kept).toBeGreaterThan(0);
+      expect(kept).toBeLessThan(count);
+      expect(preview.declarations).toEqual(
+        Array.from({ length: kept }, (_, i) => ({
+          name: `op${i}`,
+          startLine: i + 1,
+          endLine: i + 1,
+        })),
+      );
+      // The index keeps the longest prefix: one more declaration would not fit.
+      expect(Buffer.byteLength(JSON.stringify(preview))).toBeLessThanOrEqual(32000);
+      const longer = {
+        ...preview,
+        declarations: [
+          ...preview.declarations!,
+          { name: `op${kept}`, startLine: kept + 1, endLine: kept + 1 },
+        ],
+      };
+      expect(Buffer.byteLength(JSON.stringify(longer))).toBeGreaterThan(32000);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-test("skill installer forwards arguments and exit status through the platform launcher", async (t) => {
+test("skill installer uses the GitHub main skill source through the platform launcher", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "jevgrep-skill-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const bin = join(home, "installer with spaces");
@@ -21,6 +21,7 @@ test("skill installer forwards arguments and exit status through the platform la
       : `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`,
     { mode: 0o755 },
   );
+
   const cli =
     process.env.JEVGREP_TEST_CLI ??
     fileURLToPath(new URL("../apps/cli/dist/bin/index.js", import.meta.url));
@@ -48,9 +49,10 @@ test("skill installer forwards arguments and exit status through the platform la
   assert.equal(result.stderr, "");
   assert.deepEqual(JSON.parse(await readFile(join(home, "installed-skill.json"), "utf8")), [
     "--yes",
-    "skills",
+    "--ignore-scripts",
+    "skills@1.7.0",
     "add",
-    "dzhng/jevgrep",
+    "dzhng/jevgrep@main",
     "--skill",
     "jevgrep",
     "--agent",

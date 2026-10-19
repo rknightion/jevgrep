@@ -1,4 +1,4 @@
-import { inspect } from "./source";
+import { inspect, resolveLanguage } from "./source";
 import type { Snapshot } from "./filesystem";
 import type { Evaluator, FileEvidence, Range } from "./types";
 import { EvaluationFailure } from "./evaluator";
@@ -26,7 +26,7 @@ export async function selectTestBodies(
     if (
       !file.roles.includes("test") ||
       file.sourceOmitted ||
-      !/\.pyi?$/.test(snapshot.path) ||
+      resolveLanguage(snapshot.path, snapshot.source) !== "python" ||
       Buffer.byteLength(snapshot.source) > 1_000_000 ||
       shown.some((e) => e.partial || e.sourceByteStart !== undefined)
     )
@@ -37,7 +37,7 @@ export async function selectTestBodies(
     for (const unit of syntax.units) {
       if (
         unit.partial ||
-        unit.name.endsWith(".context") ||
+        unit.classContext ||
         !file.selected.some((r) => r.sourceByteStart === undefined && contains(r, unit.range)) ||
         !shown.some((e) => contains(e.range, unit.range))
       )

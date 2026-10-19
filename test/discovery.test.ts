@@ -610,7 +610,7 @@ testIfDocker(
 );
 
 testIfDocker(
-  "relationship discovery follows controlled provider completion order",
+  "relationship discovery does not depend on provider completion order",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "jg-completion-order-"));
     try {
@@ -623,15 +623,20 @@ testIfDocker(
         for (let i = 0; i < 30; i++)
           await writeFile(join(root, dir, `f${i}.txt`), '\"'.repeat(2000));
       }
-      const actual = await trajectory(root, true);
-      const descendant = actual.find((body) =>
-        body.state.items?.[0]?.path.startsWith("src/relatedZ/"),
-      );
-      expect(descendant).toBeDefined();
-      const firstDescendant = actual.find(
+      const navigation = (requests: Body[]) =>
+        requests.filter((body) => body.state.items).map((body) => JSON.stringify(body));
+      const inOrder = await trajectory(root);
+      // The later relationship branch answers first, as an asynchronous provider can.
+      const reversed = await trajectory(root, true);
+      expect(navigation(reversed)).toEqual(navigation(inOrder));
+      const descendants = reversed.filter(
         (body) => body.state.relationAnchor && body.state.items?.[0]?.kind === "file",
       );
-      expect(firstDescendant?.state.items?.[0]?.path.startsWith("src/relatedZ/")).toBe(true);
+      expect(descendants.map((body) => body.state.items![0]!.path.split("/")[1])).toContain(
+        "relatedZ",
+      );
+      // Relationship seeds follow their directory order.
+      expect(descendants[0]?.state.items?.[0]?.path.startsWith("src/relatedA/")).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -835,4 +840,307 @@ testIfDocker(
     }
   },
   120_000,
+);
+
+testIfDocker(
+  "discovery scores a bounded prefix before reading late files and retains late matches",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-stream-discovery-"));
+    let first!: () => void;
+    const started = new Promise<void>((resolve) => {
+      first = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const count = 100;
+    for (let index = 0; index < count; index++)
+      await writeFile(
+        join(root, `${String(index).padStart(3, "0")}.txt`),
+        "source line\n".repeat(2500),
+      );
+    const latePath = join(root, "099.txt");
+    const pending = retrieve(
+      { root, query: "late match", signal: new AbortController().signal },
+      {
+        requests: 0,
+        async evaluate(request) {
+          const state = request.state as {
+            items?: Array<{ path: string; filePreview?: { text: string } }>;
+          };
+          if (state.items) {
+            first();
+            await writeFile(latePath, "LATE_MATCH\n".repeat(2500));
+            await gate;
+          }
+          return Object.fromEntries(
+            Object.keys(request.questions).map((id, index) => [
+              id,
+              state.items
+                ? state.items[index]?.filePreview?.text.includes("LATE_MATCH")
+                  ? 0.9
+                  : 0.1
+                : 0.9,
+            ]),
+          );
+        },
+      },
+    );
+    try {
+      await started;
+      release();
+      const result = await pending;
+      expect(result.status).toBe("complete");
+      expect(result.files.map((file) => file.path)).toEqual(["099.txt"]);
+    } finally {
+      release();
+      await pending;
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  30000,
+);
+
+testIfDocker(
+  "discovery propagates source-generator errors after active work drains",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-generator-error-"));
+    const source = await import("../packages/core/src/source");
+    const { spyOn } = await import("bun:test");
+    const failure = new Error("fixture preview failure");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    let active = 0;
+    let callsAtFailure = 0;
+    let preview;
+    try {
+      for (let index = 0; index < 200; index++)
+        await writeFile(join(root, `a${String(index).padStart(3, "0")}.txt`), `entry ${index}\n`);
+      await writeFile(join(root, "z.py"), "def f():\n    return 1\n".repeat(4000));
+      preview = spyOn(source, "pythonPreview").mockImplementation(async () => {
+        callsAtFailure = calls;
+        setTimeout(release, 0);
+        throw failure;
+      });
+      await expect(
+        retrieve(
+          { root, query, signal: new AbortController().signal },
+          {
+            requests: 0,
+            async evaluate() {
+              calls++;
+              active++;
+              try {
+                await gate;
+                throw new EvaluationFailure("provider", true);
+              } finally {
+                active--;
+              }
+            },
+          },
+        ),
+      ).rejects.toBe(failure);
+      expect(callsAtFailure).toBeGreaterThan(0);
+      expect(calls).toBe(callsAtFailure);
+      expect(active).toBe(0);
+    } finally {
+      release();
+      preview?.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  30000,
+);
+
+testIfDocker("discovery propagates result-processing errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "jg-discovery-error-"));
+  const failure = new Error("broken result consumer");
+  try {
+    await writeFile(join(root, "source.txt"), "source\n");
+    await expect(
+      retrieve(
+        { root, query, signal: new AbortController().signal },
+        {
+          requests: 0,
+          async evaluate() {
+            return Object.defineProperty({}, "q0", {
+              get() {
+                throw failure;
+              },
+            });
+          },
+        },
+      ),
+    ).rejects.toBe(failure);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+testIfDocker(
+  "completed navigation groups survive a terminal stop behind an unfinished split",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-discovery-completed-stop-"));
+    try {
+      for (let index = 0; index < 257; index++)
+        await writeFile(join(root, `f${String(index).padStart(3, "0")}.txt`), `entry ${index}\n`);
+      const result = await retrieve(
+        { root, query: "completed group", signal: new AbortController().signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            const items = (request.state as Body["state"]).items;
+            if (items) {
+              if (items[0]?.path === "f000.txt") throw new EvaluationFailure("provider", true);
+              if (items[0]?.path === "f050.txt") throw new EvaluationFailure("request-limit");
+            }
+            return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+          },
+        },
+      );
+      expect(result.status).toBe("incomplete");
+      expect(result.files.map(({ path }) => path)).toContain("f025.txt");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+testIfDocker("oversized preview chunks retain main's batch ordering", async () => {
+  const root = await mkdtemp(join(tmpdir(), "jg-oversized-order-"));
+  const requests: Array<{ paths: string[]; bytes: number; chunks: string[] }> = [];
+  try {
+    await writeFile(
+      join(root, "a.ts"),
+      Array.from(
+        { length: 1500 },
+        (_, index) => `export function f${index}() { return ${index}; }\n`,
+      ).join(""),
+    );
+    await writeFile(join(root, "b.txt"), "b");
+    for (const directory of ["dir-a", "dir-b"]) {
+      await mkdir(join(root, directory));
+      await writeFile(join(root, directory, "file.txt"), `${directory} source\n`);
+    }
+    const result = await retrieve(
+      { root, query: "context ".repeat(3000), signal: new AbortController().signal },
+      {
+        requests: 0,
+        async evaluate(request) {
+          const items = (request.state as Body["state"]).items;
+          if (items)
+            requests.push({
+              paths: items.map((item) => item.path),
+              bytes: Buffer.byteLength(JSON.stringify(request)),
+              chunks: items
+                .filter((item) => item.path === "a.ts")
+                .map((item) => item.filePreview?.text ?? ""),
+            });
+          return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+        },
+      },
+    );
+    expect(result.status).toBe("complete");
+    expect(requests.every(({ bytes }) => bytes < 38_000)).toBe(true);
+    const sequence = requests.flatMap(({ paths }) => paths);
+    const firstChunk = sequence.indexOf("a.ts");
+    expect(firstChunk).toBeGreaterThan(-1);
+    for (const path of ["b.txt", "dir-a/file.txt", "dir-b/file.txt"])
+      expect(sequence.indexOf(path)).toBeLessThan(firstChunk);
+    const chunks = requests.flatMap(({ chunks }) => chunks);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(new Set(chunks).size).toBe(chunks.length);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+testIfDocker(
+  "cancellation during a later preview preserves an already scored navigation group",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-discovery-preview-cancel-"));
+    const controller = new AbortController();
+    const source = await import("../packages/core/src/source");
+    const { spyOn } = await import("bun:test");
+    let firstGroupComplete!: () => void;
+    const completed = new Promise<void>((resolve) => {
+      firstGroupComplete = resolve;
+    });
+    let preview;
+    try {
+      for (let index = 0; index < 128; index++)
+        await writeFile(join(root, `a${String(index).padStart(3, "0")}.txt`), `entry ${index}\n`);
+      await writeFile(join(root, "z.py"), "def f():\n    return 1\n".repeat(2000));
+      preview = spyOn(source, "pythonPreview").mockImplementation(async () => {
+        await Promise.race([completed, new Promise<void>((resolve) => setTimeout(resolve, 100))]);
+        const reason = new DOMException("cancelled by fixture", "AbortError");
+        controller.abort(reason);
+        throw reason;
+      });
+      const result = await retrieve(
+        { root, query: "find the implementation", signal: controller.signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            const state = request.state as { items?: Array<{ path: string }>; source?: string };
+            if (state.items)
+              return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+            firstGroupComplete();
+            return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+          },
+        },
+      );
+      expect(result.status).toBe("interrupted");
+      expect(result.files.map(({ path }) => path)).toContain("a000.txt");
+    } finally {
+      controller.abort();
+      firstGroupComplete();
+      preview?.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+testIfDocker(
+  "cancellation during per-group source confirmation preserves the scored Python file",
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "jg-discovery-probe-cancel-"));
+    const controller = new AbortController();
+    const source = await import("../packages/core/src/source");
+    const { spyOn } = await import("bun:test");
+    const reason = new DOMException("cancelled during probe", "AbortError");
+    let inspect;
+    try {
+      await writeFile(
+        join(root, "target.py"),
+        "class Target:\n    def run(self):\n        return 1\n",
+      );
+      inspect = spyOn(source, "inspect").mockImplementation(async () => {
+        controller.abort(reason);
+        throw reason;
+      });
+      const result = await retrieve(
+        { root, query: "find Target", signal: controller.signal },
+        {
+          requests: 0,
+          async evaluate(request) {
+            const items = (request.state as { items?: unknown[] }).items;
+            return Object.fromEntries(
+              Object.keys(request.questions).map((id) => [id, items ? 0.9 : 0.9]),
+            );
+          },
+        },
+      );
+      expect(result.status).toBe("interrupted");
+      expect(result.files.map(({ path }) => path)).toContain("target.py");
+    } finally {
+      controller.abort(reason);
+      inspect?.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
 );

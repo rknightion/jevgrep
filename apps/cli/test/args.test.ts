@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { parseCommand } from "../src/args";
+import { help, parseCommand } from "../src/args";
 
 test("search accepts independent policy flags and a dash-prefixed root after --", () => {
   expect(
@@ -20,11 +20,26 @@ test("search accepts independent policy flags and a dash-prefixed root after --"
     maxRequests: 1000,
     maxSourceBytes: 12,
     maxOutputBytes: 256000,
+    noLocations: false,
     policy: { hidden: true },
   });
   expect(() => parseCommand(["question", "a", "b"])).toThrow();
   expect(() => parseCommand(["question", "--max-source-bytes", "-1"])).toThrow();
   expect(() => parseCommand(["question", "--secret-mistake"])).toThrow("Unknown option");
+});
+
+test("no-locations threads through to the search command", () => {
+  expect(parseCommand(["question", "--no-locations"])).toMatchObject({
+    kind: "search",
+    noLocations: true,
+  });
+  const def = parseCommand(["question"]);
+  if (def.kind !== "search") throw new Error("Expected search");
+  expect(def.noLocations).toBe(false);
+});
+
+test("help documents the no-locations flag", () => {
+  expect(help).toContain("--no-locations");
 });
 
 test("request and output ceilings accept explicit bounds", () => {
@@ -140,6 +155,17 @@ test("files takes an optional root and only the filesystem policy flags", () => 
     ["files", "--provider", "vercel"],
   ])
     expect(() => parseCommand(args)).toThrow("Usage: jg files");
+});
+
+test("files lists eligible paths only when explicitly requested", () => {
+  expect(parseCommand(["files", "src", "--list", "--exclude", "generated/"])).toMatchObject({
+    kind: "files",
+    root: "src",
+    list: true,
+    policy: { exclude: ["generated/"] },
+  });
+  for (const args of [["question"], ["doctor"], ["auth"], ["skill"], ["cache", "clear"]])
+    expect(() => parseCommand([...args, "--list"])).toThrow();
 });
 
 test("exclude patterns are repeatable, normalized for cache identity, and limited to search or files", () => {

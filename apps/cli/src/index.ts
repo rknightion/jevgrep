@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { authenticate, loadCredentials } from "./auth";
 import { endpointFor } from "@repo/core/providers";
+import type { Inventory, RetrievalResult } from "@repo/core";
 import { storageDirectory } from "@repo/core/storage";
 import { help, parseCommand } from "./args";
 import { CliError } from "./errors";
@@ -9,6 +10,8 @@ import { stat } from "node:fs/promises";
 import { version } from "../package.json";
 import { installSkill } from "./skill";
 import { startWatchdog } from "./watchdog";
+import { createProgress } from "./progress";
+import { exitCodeForResult } from "./exit-code";
 
 globalThis.AI_SDK_LOG_WARNINGS = false;
 
@@ -30,6 +33,13 @@ async function write(text: string) {
   if (pipeClosed) return;
   await new Promise<void>((resolve, reject) => {
     process.stdout.write(text, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+function terminalProgress() {
+  return createProgress({
+    enabled: process.stdout.isTTY === true && process.stderr.isTTY === true && !process.env.CI,
+    write: (text) => process.stderr.write(text),
   });
 }
 
@@ -98,15 +108,23 @@ async function main() {
       if (!(await stat(command.root).catch(() => undefined))?.isDirectory())
         throw new CliError("The root must be an existing directory.");
       const { inventory } = await import("@repo/core");
-      const result = await inventory({
-        root: command.root,
-        policy: command.policy,
-        signal: controller.signal,
-      });
+      const progress = terminalProgress();
+      progress.start();
+      let result: Inventory;
+      try {
+        result = await inventory({
+          root: command.root,
+          includePaths: command.list,
+          policy: command.policy,
+          signal: controller.signal,
+          progress: (snapshot) => progress.update(snapshot),
+        });
+      } finally {
+        progress.done();
+      }
       if (pipeClosed) return;
       await write(renderInventory(result));
-      process.exitCode =
-        result.status === "interrupted" ? 130 : result.status === "incomplete" ? 2 : 0;
+      process.exitCode = exitCodeForResult(result);
       return;
     }
     case "search": {
@@ -124,19 +142,28 @@ async function main() {
         ...credentials,
         signal: controller.signal,
       });
-      const result = await retrieve(
-        {
-          root: command.root,
-          query: command.query,
-          policy: command.policy,
-          signal: controller.signal,
-        },
-        evaluator,
-      );
+      const progress = terminalProgress();
+      progress.start();
+      let result: RetrievalResult;
+      try {
+        result = await retrieve(
+          {
+            root: command.root,
+            query: command.query,
+            policy: command.policy,
+            signal: controller.signal,
+            progress: (snapshot) => progress.update(snapshot),
+          },
+          evaluator,
+        );
+      } finally {
+        progress.done();
+      }
       if (pipeClosed) return;
-      await write(renderResult(result, command.maxSourceBytes, command.maxOutputBytes));
-      process.exitCode =
-        result.status === "interrupted" ? 130 : result.status === "incomplete" ? 2 : 0;
+      await write(
+        renderResult(result, command.maxSourceBytes, command.maxOutputBytes, command.noLocations),
+      );
+      process.exitCode = exitCodeForResult(result);
     }
   }
 }

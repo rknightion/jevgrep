@@ -1,6 +1,49 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { inspect } from "../../packages/core/src/source.ts";
+import {
+  inspect,
+  pythonNeighborhood,
+  sourceForUnit,
+  splitSource,
+} from "../../packages/core/src/source.ts";
+
+test("extensionless Python shebangs preserve declarations, comments and neighboring source", async () => {
+  for (const shebang of [
+    "#!/usr/bin/env python3",
+    "#!/usr/bin/env -S python3 -u",
+    "#!/usr/bin/env -S PYTHONUNBUFFERED=1 python3",
+    "#!/usr/bin/env -S -u PYTHONPATH python3",
+    "#! /usr/bin/python3.12\r",
+  ]) {
+    const source =
+      shebang +
+      '\n# module\nclass Example:\n    """context"""\n    def first(self):\n        return "é"\n    @decorator\n    def middle(self):\n        return self.first()\n    def last(self):\n        pass\n';
+    const snapshot = { path: "bin/tool", contentHash: "fixture", source };
+    const withExtension = { ...snapshot, path: "bin/tool.py" };
+    const expected = await inspect(withExtension);
+    assert.equal(expected.mode, "python");
+    assert.deepEqual(await inspect(snapshot), expected, shebang);
+    const selected = [{ startLine: 8, endLine: 9 }];
+    const neighbors = await pythonNeighborhood(withExtension, selected);
+    assert.ok(neighbors.some((range) => range.startLine === 5 && range.endLine === 6));
+    assert.deepEqual(await pythonNeighborhood(snapshot, selected), neighbors, shebang);
+  }
+});
+
+test("extensionless Node shebangs preserve JavaScript declarations and selected source", async () => {
+  for (const shebang of [
+    "#!/usr/bin/env node",
+    "#!/usr/bin/nodejs",
+    "#!/usr/bin/env -S NODE_ENV=production node",
+  ]) {
+    const source = shebang + '\n// module\nfunction target() {\n  return "🙂";\n}\n';
+    const snapshot = { path: "bin/tool", contentHash: "fixture", source };
+    const expected = await inspect({ ...snapshot, path: "bin/tool.js" });
+    assert.equal(expected.mode, "typescript");
+    assert.deepEqual(await inspect(snapshot), expected, shebang);
+    assert.equal(expected.units[0]!.name, "target");
+  }
+});
 
 test("Python preserves decorators, class context and nested declarations", async () => {
   const source =
@@ -58,6 +101,11 @@ test("syntax errors and unsupported source fall back without losing source lines
     ["bad.py", "def broken(:\n  return 2\n", "syntax"],
     ["bad.ts", "const = ;", "syntax"],
     ["readme.md", "éé\r\nnext\r\nlast", "unsupported"],
+    ["tool", "def target():\n    pass\n", "unsupported"],
+    ["tool", "#!/bin/bash\ndef target():\n    pass\n", "unsupported"],
+    ["tool", "\n#!/usr/bin/env python3\ndef target():\n    pass\n", "unsupported"],
+    ["tool.sh", "#!/usr/bin/env python3\ndef target():\n    pass\n", "unsupported"],
+    ["tool.js", "#!/usr/bin/env python3\ndef target():\n    pass\n", "syntax"],
   ]) {
     const result = await inspect(
       { path: path!, source: source!, contentHash: "fixture" },
@@ -328,4 +376,181 @@ test("same-named classes retain their own structural headers", async () => {
       { startLine: 4, endLine: 4 },
     ]);
   }
+});
+
+test("generated TypeScript deeper than the call stack parses or falls back to text", async () => {
+  const { sourceForUnit } = await import("../../packages/core/src/source.ts");
+  // A long flat expression nests one level per operator in the syntax tree.
+  const chain = "// generated\nexport const table = " + "1 + ".repeat(50_000) + "1;\n";
+  const parsed = await inspect(
+    { path: "chain.ts", source: chain, contentHash: "fixture" },
+    { maxUnitBytes: Buffer.byteLength(chain) },
+  );
+  assert.equal(parsed.mode, "typescript");
+  assert.deepEqual(
+    parsed.units.map(({ name, range }) => ({ name, ...range })),
+    [{ name: "table", startLine: 2, endLine: 2 }],
+  );
+  assert.deepEqual(parsed.comments, [{ startLine: 1, endLine: 1 }]);
+  const nested = "export const x = " + "(".repeat(20_000) + "1" + ")".repeat(20_000) + ";\n";
+  const snapshot = { path: "nested.ts", source: nested, contentHash: "fixture" };
+  const fallback = await inspect(snapshot, { maxUnitBytes: 3000 });
+  assert.equal(fallback.mode, "text");
+  assert.equal(fallback.fallback, "syntax");
+  assert.equal(fallback.units.map((unit) => sourceForUnit(snapshot, unit)).join(""), nested);
+});
+
+test("Python nested beyond the query depth falls back quickly while wide files parse", async () => {
+  const { sourceForUnit } = await import("../../packages/core/src/source.ts");
+  // One level per `+`: past 65,535 levels Tree-sitter queries miss matches and slow down sharply.
+  const deep = "def f():\n    return 1\nvalue = " + "1+".repeat(100_000) + "1\n";
+  const snapshot = { path: "generated.py", source: deep, contentHash: "fixture" };
+  const started = performance.now();
+  const result = await inspect(snapshot, { maxUnitBytes: 3000 });
+  assert.ok(performance.now() - started < 10_000, "deep source was not rejected quickly");
+  assert.equal(result.mode, "text");
+  assert.equal(result.fallback, "syntax");
+  assert.equal(result.units.map((unit) => sourceForUnit(snapshot, unit)).join(""), deep);
+  // Many statements or elements make a wide tree, not a deep one.
+  const wide =
+    "def f():\n    return 1\n" +
+    Array.from({ length: 30_000 }, (_, i) => `x${i} = [${i}, ${i}]`).join("\n") +
+    "\n";
+  const parsed = await inspect({ path: "wide.py", source: wide, contentHash: "fixture" });
+  assert.equal(parsed.mode, "python");
+  assert.equal(parsed.units[0]?.name, "f");
+});
+
+test("class context is marked structurally, not inferred from member names", async () => {
+  const marked = async (path: string, source: string) =>
+    (await inspect({ path, source, contentHash: "fixture" })).units.map(
+      ({ name, range, classContext }) =>
+        `${name}@${range.startLine}-${range.endLine}${classContext ? " [class context]" : ""}`,
+    );
+  assert.deepEqual(
+    await marked(
+      "template.py",
+      'class Template:\n    """Render with a context."""\n    engine = None\n\n    def context(self, request):\n        return {"request": request}\n\n    def render(self, request):\n        return self.context(request)\n',
+    ),
+    [
+      "Template.context@1-4 [class context]",
+      "Template.context@5-6",
+      "Template.context@7-7 [class context]",
+      "Template.render@8-9",
+    ],
+  );
+  assert.deepEqual(
+    await marked(
+      "widget.ts",
+      'export class Widget {\n  static kind = "w";\n  context() {\n    return {};\n  }\n}\nexport class Inline { context() { return 1; } }\n',
+    ),
+    [
+      "Widget.context@1-1 [class context]",
+      "Widget.kind@2-2",
+      "Widget.context@3-5",
+      "Inline.context@7-7",
+    ],
+  );
+  assert.deepEqual(
+    await marked(
+      "widget.rs",
+      "struct Widget;\nimpl Widget {\n    fn context(&self) -> u32 {\n        1\n    }\n}\n",
+    ),
+    ["Widget@1-1", "Widget.context@2-2 [class context]", "Widget.context@3-5"],
+  );
+});
+
+test("fragment extraction reuses one encoded source allocation", () => {
+  const source = "é漢🙂 source line\r\n".repeat(2_000);
+  const snapshot = { path: "wide.txt", contentHash: "fixture", source };
+  const originalFrom = Buffer.from;
+  let encodedBytes = 0;
+  // Keep this global allocation probe in a non-concurrent test.
+  Buffer.from = ((...args: Parameters<typeof Buffer.from>) => {
+    if (typeof args[0] === "string") encodedBytes += Buffer.byteLength(args[0]);
+    return Reflect.apply(originalFrom, Buffer, args);
+  }) as typeof Buffer.from;
+  try {
+    const pieces = splitSource(snapshot, 1_000).map((unit) => sourceForUnit(snapshot, unit));
+    assert.equal(pieces.join(""), source);
+    assert.ok(encodedBytes <= Buffer.byteLength(source) * 2, `encoded ${encodedBytes} bytes`);
+  } finally {
+    Buffer.from = originalFrom;
+  }
+});
+
+test("cached source fragments preserve UTF-8 bytes and line coordinates", async () => {
+  for (const source of ["", "é漢🙂", "é漢🙂\n", "é漢🙂\r\nlast", "é漢🙂".repeat(8_000)]) {
+    const snapshot = { path: "text.txt", contentHash: "fixture", source };
+    const fragments = splitSource(snapshot, 16);
+    assert.equal(fragments.map((unit) => sourceForUnit(snapshot, unit)).join(""), source);
+    assert.deepEqual(splitSource(snapshot, 16), fragments);
+    const parsed = await inspect(snapshot, { maxUnitBytes: 16 });
+    assert.equal(parsed.units.map((unit) => sourceForUnit(snapshot, unit)).join(""), source);
+    if (source) {
+      assert.equal(fragments[0]!.sourceByteStart, 0);
+      assert.equal(fragments.at(-1)!.sourceByteEnd, Buffer.byteLength(source));
+      assert.equal(fragments.at(-1)!.range.endLine, source.split("\n").length);
+    }
+  }
+});
+
+test("snapshot-keyed source cache refreshes after source mutation", async () => {
+  const snapshot = { path: "same.txt", contentHash: "fixture", source: "old\nsource" };
+  const oldFragments = splitSource(snapshot, 4);
+  assert.equal(oldFragments.map((unit) => sourceForUnit(snapshot, unit)).join(""), snapshot.source);
+
+  const other = { ...snapshot, source: "é漢🙂\r\nnew" };
+  assert.equal(
+    splitSource(other, 4)
+      .map((unit) => sourceForUnit(other, unit))
+      .join(""),
+    other.source,
+  );
+
+  snapshot.source = "changed\n🙂";
+  const changed = await inspect(snapshot, { maxUnitBytes: 4 });
+  assert.equal(
+    changed.units.map((unit) => sourceForUnit(snapshot, unit)).join(""),
+    snapshot.source,
+  );
+  assert.equal(
+    splitSource(snapshot, 4)
+      .map((unit) => sourceForUnit(snapshot, unit))
+      .join(""),
+    snapshot.source,
+  );
+  assert.equal(
+    splitSource(other, 4)
+      .map((unit) => sourceForUnit(other, unit))
+      .join(""),
+    other.source,
+  );
+});
+
+test("long Python comment runs parse quickly without changing declarations", async () => {
+  const run = (indent: string, count: number) =>
+    Array.from({ length: count }, (_, i) => `${indent}# n${i} don't "q" {x}`).join("\n");
+  // Parsing was quadratic in a comment run: 8,000 lines took 9.5 s.
+  const source =
+    `class Box:\n${run("    ", 12_000)}\n    def first(self):\n        return 1\n` +
+    `${run("", 12_000)}\ndef second():\n    return 2\n`;
+  const started = performance.now();
+  const result = await inspect(
+    { path: "notes.py", source, contentHash: "fixture" },
+    { maxUnitBytes: Buffer.byteLength(source) },
+  );
+  assert.ok(performance.now() - started < 5_000, "comment runs were not parsed quickly");
+  assert.deepEqual(
+    result.units.map(({ name, range }) => `${name}@${range.startLine}-${range.endLine}`),
+    ["Box.context@1-12001", "Box.first@12002-12003", "second@24004-24005"],
+  );
+  // Comment-looking lines inside a string are string content, even with quotes and braces.
+  const inString = `value = f"""\n${run("", 300)}\n"""\n` + 'def after():\n    return """#"""\n';
+  const parsed = await inspect({ path: "doc.py", source: inString, contentHash: "fixture" });
+  assert.equal(parsed.mode, "python");
+  assert.deepEqual(
+    parsed.units.map(({ name, range }) => `${name}@${range.startLine}-${range.endLine}`),
+    ["after@303-304"],
+  );
 });

@@ -163,11 +163,21 @@ At a nested repository boundary reset inherited `.gitignore` scope; ancestor
 `.ignore` remains applicable. Read parent rules only within the explicit root.
 
 Skip dot paths, dependency/build directories, binary/invalid UTF-8 content, obvious
-credential filenames and private-key markers by default. Final exact name lists
-are delegated to one documented policy module with fixtures, not scattered regexes.
+credential filenames (including `.env` variants and any path component whose
+name ends in `.env`) and private-key markers by default. After an eligible file is decoded, exclude the whole file as
+`sensitive_content` when its content matches the conservative detector in
+`packages/core/src/secrets.ts`: known provider prefixes (including `npm_` and
+`glpat-`), Slack webhook URLs, or credential-shaped assignments whose values are
+at least 16 characters with at least 3.5 bits/character of Shannon entropy.
+Placeholder values and UUID-shaped identifiers are excluded from the entropy
+signal. This heuristic is best effort and does not redact or guarantee that
+sensitive content is absent. `includeSensitive` / `--include-sensitive` bypasses
+the sensitive-name, private-key, and sensitive-content checks while leaving the
+other filesystem policy and hard exclusions in force. Final exact name lists are
+delegated to one documented policy module with fixtures, not scattered regexes.
 Overrides do not make binary files parseable. Hard-exclude Jevgrep's own credential
 and cache storage and Git metadata. Read eligibility metadata without uploading
-excluded source. No secret scanning guarantee beyond the documented policy.
+excluded source.
 
 Resolve the requested root once. Do not follow descendant symlinks in v1; skip
 sockets, devices and FIFOs. Normal policy exclusions are not incomplete searches.
@@ -195,7 +205,9 @@ Malformed/missing answers remain unknown. Healthy negative evaluations may be
 cached; failed or incomplete answers may not. Partial provider failures preserve
 other useful evidence and are summarized by kind/count, not negative-path lists.
 
-Default cache directory: `$XDG_CACHE_HOME/jevgrep`, else `~/.cache/jevgrep`.
+XDG config and cache overrides are honored only when their values are absolute;
+relative values are ignored. Default cache directory: `$XDG_CACHE_HOME/jevgrep`,
+else `~/.cache/jevgrep`.
 Keep source and credentials out of cache payloads: store content-derived keys and
 validated answers, not full source packets. Hash the exact native semantic request
 including query, source, path/context, ordered questions, model/provider identity,

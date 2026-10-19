@@ -28,9 +28,6 @@ jg "How are telemetry events recorded and sent?" ./my-project
 Requires **Node.js 22+**, **macOS, Linux, or Windows**, and a key for **Vercel AI Gateway, TypeSafe, OpenRouter, OpenCode Zen, Cloudflare AI Gateway, or a custom TypeSafe-compatible endpoint**.
 No separate Python, Bun, or ripgrep installation is required to use `jg`.
 
-Provider selection requires **0.3.0 or newer**. Upgrade an older installation with
-`npm install --global @dzhng/jevgrep@latest`.
-
 ## Install the agent skill — required for agent setup
 
 Installing the CLI alone does not teach your coding agent to use it. **Install
@@ -48,15 +45,11 @@ It leaves research and implementation decisions to the calling agent. The curren
 checks for `jg` and installs the CLI if it is missing; authentication still needs
 your selected provider’s key. The skill installer itself does not configure credentials.
 
-`jg skill` delegates to the [skills CLI](https://github.com/vercel-labs/skills)
-and needs npm/npx plus network access. You can also run that installer directly,
-without the CLI installed:
-
-```sh
-npx skills add dzhng/jevgrep --skill jevgrep
-```
-
-In 0.1.0, `jg skill` only prints the bundled skill; use `npx skills` with that version.
+`jg skill` installs the `jevgrep` skill from the repository's `main` branch using
+a pinned [skills CLI](https://github.com/vercel-labs/skills), with npm lifecycle
+scripts disabled. Skill installation needs Node 22.20+ and npm/npx plus network
+access for the installer. Rerun `jg skill` to get the current skill without
+waiting for a new npm release.
 
 ### Upgrade
 
@@ -67,9 +60,11 @@ npm install -g @dzhng/jevgrep@latest
 jg --version
 ```
 
-Update the installed skill separately by rerunning `jg skill`. Updating the npm package does not
-overwrite skill files in your projects. See the [package guide](apps/cli/README.md)
-for authentication details.
+After updating the CLI, refresh the installed skill by rerunning `jg skill`.
+Updating the npm package does not overwrite skill files in your projects. The
+installer records the GitHub source and skill path in `skills-lock.json`; rerun
+`jg skill` on another machine or after changing your Node installation. See the
+[package guide](apps/cli/README.md) for authentication details.
 
 ## Start with a question, leave with source
 
@@ -89,7 +84,8 @@ list.
 
 The summary and compact file list come first, followed by selected source with
 line references, then detailed declaration and call locations. Python, TypeScript/JavaScript, Go and Rust support declaration
-parsing; other text uses a fallback. The output is evidence for the agent to use,
+parsing, with extensionless Python and Node scripts recognised by their shebang;
+other text uses a fallback. The output is evidence for the agent to use,
 not a generated answer or a guarantee that every relevant file was found.
 [See a recorded output example](specs/done/jevgrep/assets/stdout-example.txt).
 
@@ -130,8 +126,16 @@ Current protocols and subsequent experiments are in the
 
 Searches send eligible source content to Jev through the provider selected during auth. Default
 filesystem filtering respects ignore files and excludes hidden, dependency/build,
-binary, and obvious credential files. These filters are not a guarantee that all
+binary, and obvious credential files, including `.env` variants and any path
+component whose name ends in `.env`.
+It also excludes a whole file as `sensitive_content` when its text matches a
+conservative credential heuristic: a known provider token prefix (such as `npm_`
+or `glpat-`), a Slack webhook URL, or a credential-shaped assignment with a
+long, high-entropy value. UUID-shaped identifiers are excluded from that entropy
+signal. This is best-effort detection, not redaction or a guarantee that all
 sensitive information has been removed; choose a search root you intend to send.
+Use `--include-sensitive` when a search must include sensitive names, private-key
+markers, and content-level matches.
 `jg files [root]` counts the files a search under that root may read, grouped by
 top-level directory, with no provider key or network request. It takes the same
 filtering flags as search.
@@ -162,5 +166,8 @@ reasoning behind retrieval, parsing, caching, and failure handling, start with t
 [architecture](docs/architecture.md) and [implementation record](specs/done/jevgrep/README.md).
 [Release guidance](scripts/RELEASING.md) covers tag-triggered npm publication and
 verification of the exact public package.
+
+See [Contributing](CONTRIBUTING.md) for the pull-request review and maintenance
+policy.
 
 [MIT](LICENSE). [Artwork and generation prompts](assets/README.md).

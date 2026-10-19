@@ -82,7 +82,8 @@ jg auth --provider cloudflare --base-url https://gateway.ai.cloudflare.com/v1/AC
 Credentials are saved under
 `$XDG_CONFIG_HOME/jevgrep/credentials.json`, or `~/.config/jevgrep/credentials.json`.
 On Windows, config defaults to `%APPDATA%\jevgrep` and cache to `%LOCALAPPDATA%\jevgrep`.
-`XDG_CONFIG_HOME` and `XDG_CACHE_HOME` override their respective locations independently.
+`XDG_CONFIG_HOME` and `XDG_CACHE_HOME` override their respective locations independently
+when set to absolute paths; relative values are ignored and platform defaults are used.
 Windows ignores POSIX file modes, so these files rely on the user profile's access controls.
 Existing saved records without a provider still mean Vercel, without a migration.
 API-key, endpoint, and model environment overrides are ignored; users who only
@@ -90,6 +91,10 @@ configured an environment key must run auth. There is no automatic fallback or
 per-search provider override. Searches send eligible source to the saved service.
 Run `jg files ./project` first to see how many files and bytes that root makes
 eligible and how many paths each filter skips; it needs no key and sends nothing.
+Add `--list` to see the eligible relative paths, quoted and sorted. To remove a
+path you did not intend to send, repeat the preview with `--exclude` and use the
+same exclusions for the search. An incomplete preview lists only paths seen
+before the limit or interruption; search-time content checks can exclude more.
 Evaluation answers are cached locally; `jg --help` describes cache controls.
 
 For a slow or unstable connection, try `jg "question" ./project --concurrency 4`
@@ -105,6 +110,12 @@ reported concurrency limit helps tune the next run. Only validated evaluation
 answers are cached: provider errors and the final search result are never stored.
 Rerunning after the connection recovers retries failed work while reusing valid
 answers; `--no-cache` additionally bypasses those valid cached answers.
+
+Bounded resource limits are a backstop for large or changing trees. They remain
+visible as `discovery incomplete` and `Issue: "resource_limit"`, but a result
+containing only those issues exits successfully so shells and coding agents do
+not mistake useful partial output for a failed command. Provider and other
+operational issues retain the incomplete exit status.
 
 The summary comes first, followed by file and declaration locations and selected
 source. Locations are reading leads, not a checklist. Omitted excerpts are marked;
@@ -126,17 +137,13 @@ The installer detects your coding agents (Claude Code, Codex, OpenCode and
 others) and asks where to install. `jg skill` also accepts `--agent NAME`
 (repeatable), `--global`, and `--yes`; these options come from the
 [skills CLI](https://github.com/vercel-labs/skills#install-a-skill), which it
-delegates to, so it requires npm/npx and network access. You can run that
-installer directly as well:
+delegates to. `jg skill` installs the `jevgrep` skill from this repository's
+`main` branch with npm lifecycle scripts disabled and requires Node 22.20+ and
+npm/npx with network access for the pinned installer. Rerun `jg skill` to refresh
+the skill without waiting for a new npm release. Installer transitive
+dependencies remain an external trust boundary.
 
-```sh
-npx skills add dzhng/jevgrep --skill jevgrep
-```
-
-Installing the skill does not install the `jg` executable or configure its key.
-The current repository skill installs a missing CLI when the agent first uses it;
-0.1.0's bundled skill predates that setup step, and its `jg skill` only prints
-text, so use `npx skills` directly with that version.
+Installing the skill does not configure the provider key.
 
 Search does not install skills or edit agent configuration. Only an explicit
 skill installation command invokes the installer. The skill directs the agent
@@ -144,8 +151,9 @@ to read returned excerpts before further discovery, skip redundant searches when
 the needed context is already known, and handle incomplete results honestly.
 
 There is no built-in upgrade command. Use `npm install --global @dzhng/jevgrep@latest`
-to upgrade the CLI, then rerun `jg skill` to update
-the agent's copy too.
+to upgrade the CLI, then rerun `jg skill` to update the agent's copy too. The
+installer records the GitHub source and skill path in `skills-lock.json`. Rerun
+`jg skill` on another machine or after changing your Node installation.
 
 See the [repository](https://github.com/dzhng/jevgrep) for architecture, official
 benchmark evidence and development. Jevgrep is MIT licensed.

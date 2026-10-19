@@ -46,12 +46,14 @@ export type RetrievalResult = {
   };
   counts: { requests: number; cacheHits: number; inspectedFiles: number };
 };
+export type ProgressSnapshot = { files: number; bytes: number };
 export type SearchInput = {
   root: string;
   query: string;
   policy?: FilesystemPolicy;
   signal: AbortSignal;
   protectedPaths?: string[];
+  progress?: (snapshot: ProgressSnapshot) => void;
 };
 export type Evaluator = {
   readonly requests: number;

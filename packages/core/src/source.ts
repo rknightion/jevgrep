@@ -1,4 +1,5 @@
 import ts from "typescript";
+import { basename, extname } from "node:path";
 import { runParser } from "./parser.ts";
 
 export type Range = { startLine: number; endLine: number };
@@ -11,6 +12,9 @@ export type SourceUnit = {
   sourceByteEnd: number;
   partial?: boolean;
   ownerHeaders?: Range[];
+  /** Structural class, impl or module source between members. The name alone cannot identify
+   * it: a real member named `context` shares the `<Owner>.context` name. */
+  classContext?: true;
 };
 export type Inspection = {
   units: SourceUnit[];
@@ -19,12 +23,42 @@ export type Inspection = {
   fallback?: "unsupported" | "syntax" | "size";
 };
 
+export function resolveLanguage(
+  path: string,
+  source: string,
+): "python" | "go" | "rust" | "TS" | "TSX" | "JS" | "JSX" | undefined {
+  if (/\.pyi?$/.test(path)) return "python";
+  if (path.endsWith(".tsx")) return "TSX";
+  if (path.endsWith(".jsx")) return "JSX";
+  if (/\.[cm]?js$/.test(path)) return "JS";
+  if (/\.[cm]?ts$/.test(path)) return "TS";
+  if (path.endsWith(".go")) return "go";
+  if (path.endsWith(".rs")) return "rust";
+  if (extname(path) !== "" || !source.startsWith("#!")) return;
+  const [program = "", ...args] = source.split("\n", 1)[0]!.slice(2).trim().split(/\s+/);
+  // env options, the operand of -u/-C/-P/-a and NAME=VALUE assignments come before the command.
+  const command = args.find(
+    (arg, index) =>
+      !arg.startsWith("-") && !arg.includes("=") && !/^-[uCPa]$/.test(args[index - 1] ?? ""),
+  );
+  const interpreter = basename(basename(program) === "env" ? (command ?? "") : program);
+  if (/^python(\d+(\.\d+)?)?$/.test(interpreter)) return "python";
+  if (interpreter === "node" || interpreter === "nodejs") return "JS";
+}
+
 type SourceText = { bytes: Buffer; offsets: number[]; lineCount: number };
-function sourceText(source: string): SourceText {
+const sourceTexts = new WeakMap<Snapshot, { source: string; text: SourceText }>();
+function sourceText(snapshot: Snapshot): SourceText {
+  const { source } = snapshot;
+  const cached = sourceTexts.get(snapshot);
+  // Readonly is a type-level promise; mutable callers must not receive stale bytes.
+  if (cached?.source === source) return cached.text;
   const lines = source.split("\n"),
     offsets = [0];
   for (const line of lines) offsets.push(offsets.at(-1)! + Buffer.byteLength(line) + 1);
-  return { bytes: Buffer.from(source), offsets, lineCount: lines.length };
+  const text = { bytes: Buffer.from(source), offsets, lineCount: lines.length };
+  sourceTexts.set(snapshot, { source, text });
+  return text;
 }
 function textUnits(
   text: SourceText,
@@ -82,15 +116,17 @@ export async function inspect(
       "Source bounds must be integers; unit bytes at least 4 and parse bytes positive",
     );
   const { source, path } = snapshot;
-  const text = sourceText(source);
+  const language = resolveLanguage(path, source);
+  const text = sourceText(snapshot);
   // Context windows use conservative whole-line Python comments, including inside multiline strings.
-  const pythonComments = /\.pyi?$/.test(path)
-    ? source
-        .split("\n")
-        .flatMap((line, index) =>
-          /^\s*#/.test(line) ? [{ startLine: index + 1, endLine: index + 1 }] : [],
-        )
-    : [];
+  const pythonComments =
+    language === "python"
+      ? source
+          .split("\n")
+          .flatMap((line, index) =>
+            /^\s*#/.test(line) ? [{ startLine: index + 1, endLine: index + 1 }] : [],
+          )
+      : [];
   const fallback = (reason: Inspection["fallback"]): Inspection => ({
     mode: "text",
     fallback: reason,
@@ -100,34 +136,33 @@ export async function inspect(
       : [],
   });
   if (Buffer.byteLength(source) > maxParseBytes) return fallback("size");
-  let units: { name: string; range: Range; ownerHeaders?: Range[] }[] = [],
+  let units: { name: string; range: Range; ownerHeaders?: Range[]; classContext?: true }[] = [],
     comments: Range[] = [],
     mode: Inspection["mode"];
   let syntaxFallback = false;
-  if (/\.pyi?$/.test(path)) {
+  if (language === "python") {
     // A missing/incompatible packaged parser is a setup failure, never syntax fallback.
-    const parsed = await runParser<Array<Range & { name: string; ownerHeaders: Range[] }>>(
-      "inspect",
-      source,
-      options.signal,
-    );
+    const parsed = await runParser<
+      Array<Range & { name: string; ownerHeaders: Range[]; classContext?: boolean }>
+    >("inspect", source, options.signal);
     if (parsed === null) return fallback("syntax");
-    units = parsed.map(({ name, startLine, endLine, ownerHeaders }) => ({
+    units = parsed.map(({ name, startLine, endLine, ownerHeaders, classContext }) => ({
       name,
       range: { startLine, endLine },
       ownerHeaders,
+      ...(classContext === true ? { classContext: true as const } : {}),
     }));
     comments = pythonComments;
     mode = "python";
-  } else if (/\.(?:[cm]?[jt]s|[jt]sx)$/.test(path)) {
-    const kind = path.endsWith(".tsx")
-      ? ts.ScriptKind.TSX
-      : path.endsWith(".jsx")
-        ? ts.ScriptKind.JSX
-        : /\.[cm]?js$/.test(path)
-          ? ts.ScriptKind.JS
-          : ts.ScriptKind.TS;
-    const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, kind);
+  } else if (language === "TS" || language === "TSX" || language === "JS" || language === "JSX") {
+    let file: ts.SourceFile;
+    try {
+      file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind[language]);
+    } catch (error) {
+      // Deeply nested source can exhaust the parser's call stack: unparseable here, like a syntax error.
+      if (error instanceof RangeError) return fallback("syntax");
+      throw error;
+    }
     syntaxFallback = !!(file as ts.SourceFile & { parseDiagnostics?: unknown[] }).parseDiagnostics
       ?.length;
     const line = (position: number) => file.getLineAndCharacterOfPosition(position).line + 1;
@@ -144,7 +179,13 @@ export async function inspect(
           first = line(node.members[0]!.getStart(file));
         const header = first > start ? { startLine: start, endLine: first - 1 } : undefined;
         const headers = header ? [...ownerHeaders, header] : ownerHeaders;
-        if (header) units.push({ name: name + ".context", range: header, ownerHeaders: headers });
+        if (header)
+          units.push({
+            name: name + ".context",
+            range: header,
+            ownerHeaders: headers,
+            classContext: true,
+          });
         for (const member of node.members) add(member, name + ".", headers);
       } else
         units.push({
@@ -157,26 +198,37 @@ export async function inspect(
         });
     };
     if (!syntaxFallback) for (const statement of file.statements) add(statement);
-    const visit = (node: ts.Node) => {
+    // Pre-order walk with an explicit stack: long generated expressions nest deeper than the call
+    // stack allows. Children are pushed in reverse so they are visited in source order.
+    const walk: ts.Node[] = [file];
+    while (walk.length) {
+      const node = walk.pop()!;
       for (const comment of [
         ...(ts.getLeadingCommentRanges(source, node.getFullStart()) ?? []),
         ...(ts.getTrailingCommentRanges(source, node.end) ?? []),
       ])
         comments.push({ startLine: line(comment.pos), endLine: line(comment.end - 1) });
-      ts.forEachChild(node, visit);
-    };
-    visit(file);
+      const children: ts.Node[] = [];
+      // The callback must return undefined: a truthy result stops forEachChild early.
+      ts.forEachChild(node, (child) => {
+        children.push(child);
+      });
+      for (let index = children.length - 1; index >= 0; index--) walk.push(children[index]!);
+    }
     mode = "typescript";
-  } else if (/\.(go|rs)$/.test(path)) {
+  } else if (language === "go" || language === "rust") {
     const parsed = await runParser<{ units: typeof units; comments: Range[] }>(
       "declarations",
-      JSON.stringify({ source, language: path.endsWith(".go") ? "go" : "rust" }),
+      JSON.stringify({ source, language }),
       options.signal,
     );
     if (!parsed) return fallback("syntax");
-    units = parsed.units;
+    units = parsed.units.map(({ classContext, ...unit }) => ({
+      ...unit,
+      ...(classContext === true ? { classContext: true as const } : {}),
+    }));
     comments = parsed.comments;
-    mode = path.endsWith(".go") ? "go" : "rust";
+    mode = language;
   } else return fallback("unsupported");
   comments = [...new Map(comments.map((r) => [`${r.startLine}:${r.endLine}`, r])).values()].sort(
     (a, b) => a.startLine - b.startLine,
@@ -208,6 +260,7 @@ export async function inspect(
         text.bytes.length,
         text.offsets[unit.range.endLine] ?? text.bytes.length,
       );
+      const marker = unit.classContext ? { classContext: true as const } : {};
       if (end - start <= maxUnitBytes)
         return [
           {
@@ -217,11 +270,13 @@ export async function inspect(
             ownerHeaders: unit.ownerHeaders,
             sourceByteStart: start,
             sourceByteEnd: end,
+            ...marker,
           },
         ];
       return textUnits(text, unit.range, unit.name, maxUnitBytes, true).map((part) => ({
         ...part,
         ownerHeaders: unit.ownerHeaders,
+        ...marker,
       }));
     }),
   };
@@ -233,7 +288,11 @@ export async function pythonNeighborhood(
   selected: Range[],
   signal?: AbortSignal,
 ): Promise<Range[]> {
-  if (!/\.pyi?$/.test(snapshot.path) || Buffer.byteLength(snapshot.source) > 1_000_000) return [];
+  if (
+    resolveLanguage(snapshot.path, snapshot.source) !== "python" ||
+    Buffer.byteLength(snapshot.source) > 1_000_000
+  )
+    return [];
   return (
     (await runParser<Range[]>(
       "neighborhood",
@@ -275,7 +334,12 @@ export async function pythonPreview(
     throw new Error("Preview allowance must be at least 256 bytes");
   const result = await runParser<SourcePreview>(
     "preview",
-    JSON.stringify({ text: snapshot.source, path: snapshot.path, query, budget }),
+    JSON.stringify({
+      text: snapshot.source,
+      language: resolveLanguage(snapshot.path, snapshot.source),
+      query,
+      budget,
+    }),
     signal,
   );
   if (result?.truncated) {
@@ -322,8 +386,8 @@ export async function pythonPreview(
 
 /** Byte spans include original line endings; never widen a partial unit to whole lines. */
 export function sourceForUnit(snapshot: Snapshot, unit: SourceUnit): string {
-  return Buffer.from(snapshot.source)
-    .subarray(unit.sourceByteStart, unit.sourceByteEnd)
+  return sourceText(snapshot)
+    .bytes.subarray(unit.sourceByteStart, unit.sourceByteEnd)
     .toString("utf8");
 }
 
@@ -331,6 +395,6 @@ export function sourceForUnit(snapshot: Snapshot, unit: SourceUnit): string {
 export function splitSource(snapshot: Snapshot, maxBytes = 12_000): SourceUnit[] {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 4)
     throw new Error("Invalid source byte allowance");
-  const text = sourceText(snapshot.source);
+  const text = sourceText(snapshot);
   return textUnits(text, { startLine: 1, endLine: text.lineCount }, "source", maxBytes, false);
 }

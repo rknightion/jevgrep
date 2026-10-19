@@ -1,17 +1,22 @@
 import { createFilesystem, type FilesystemPolicy } from "./filesystem";
+import type { ProgressSnapshot } from "./types";
 
 export type InventoryInput = {
   root: string;
   policy?: FilesystemPolicy;
   signal: AbortSignal;
   protectedPaths?: string[];
+  /** Retain eligible relative paths for an explicit file listing. */
+  includePaths?: boolean;
   /** Matches the entry bound search discovery applies in retrieve.ts. */
   maxEntries?: number;
+  progress?: (snapshot: ProgressSnapshot) => void;
 };
 export type Inventory = {
   status: "complete" | "incomplete" | "interrupted";
   files: number;
   bytes: number;
+  paths?: string[];
   /** Eligible files grouped by top-level directory; "." holds files directly under the root. */
   directories: Array<{ path: string; files: number; bytes: number }>;
   excluded: Record<string, number>;
@@ -34,7 +39,15 @@ export async function inventory(input: InventoryInput): Promise<Inventory> {
   let files = 0;
   let bytes = 0;
   let seen = 0;
+  const paths = input.includePaths ? ([] as string[]) : undefined;
   const pending = ["."];
+  const reportProgress = () => {
+    try {
+      input.progress?.({ files, bytes });
+    } catch {
+      // Progress is observational and must never change inventory behavior.
+    }
+  };
   try {
     walk: for (let next = 0; next < pending.length; next++) {
       let cursor: string | undefined;
@@ -63,6 +76,8 @@ export async function inventory(input: InventoryInput): Promise<Inventory> {
             groups.set(top, group);
             files++;
             bytes += entry.bytes ?? 0;
+            paths?.push(entry.path);
+            reportProgress();
           }
         } while (cursor);
       } finally {
@@ -76,6 +91,7 @@ export async function inventory(input: InventoryInput): Promise<Inventory> {
     status: input.signal.aborted ? "interrupted" : issues.size ? "incomplete" : "complete",
     files,
     bytes,
+    ...(paths ? { paths: paths.sort() } : {}),
     directories: [...groups]
       .map(([path, group]) => ({ path, ...group }))
       .sort((a, b) => b.bytes - a.bytes || a.path.localeCompare(b.path)),
