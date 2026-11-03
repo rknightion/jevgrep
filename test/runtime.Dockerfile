@@ -8,6 +8,7 @@ COPY package.json bun.lock turbo.json ./
 COPY apps/cli/package.json apps/cli/package.json
 COPY packages/core/package.json packages/core/package.json
 COPY packages/typescript-config packages/typescript-config
+COPY scripts/install-git-hooks.mjs scripts/install-git-hooks.mjs
 RUN bun install --frozen-lockfile
 COPY apps/cli apps/cli
 COPY packages/core packages/core
