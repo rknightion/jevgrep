@@ -97,6 +97,21 @@ same exclusions for the search. An incomplete preview lists only paths seen
 before the limit or interruption; search-time content checks can exclude more.
 Evaluation answers are cached locally; `jg --help` describes cache controls.
 
+This fork adds local guards around every search and `files` run
+([`src/guard.ts`](src/guard.ts)). A root that resolves to your home or above it,
+or inside a protected path (`~/.claude*`, `~/.codex*`, `~/.config`, `~/.ssh`,
+`~/.local/state/jevgrep`, Jevgrep's config and cache), is refused; protected paths
+under a root are skipped. In each secret repository (`~/repos/chat-personal`,
+`~/repos/chat-work`) a `credentials/` directory is never read and a root inside one
+is refused. By default trackers, docs, generated and lock files are excluded, tests
+too unless the question mentions tests, and a search uses `--max-requests 250` and
+`--concurrency 8` unless you pass them. `--full` or `JG_FULL=1` lifts the defaults,
+never the guard. `$XDG_CONFIG_HOME/jevgrep/guard.json` may set `protectedPaths`,
+`secretRepositories`, `defaultExcludes`, `testExcludes`, `maxRequests` and
+`concurrency`, each replacing its default (paths absolute or `~/`);
+`JEVGREP_PROTECTED_PATHS` and `JEVGREP_SECRET_REPOSITORIES` replace those two lists
+again. The upstream defaults quoted below apply only in full mode.
+
 For a slow or unstable connection, try `jg "question" ./project --concurrency 4`
 (or `1` to serialize requests). The default limit is 32 across all search stages,
 including retries. Waiting for a slot does not consume the request timeout, and

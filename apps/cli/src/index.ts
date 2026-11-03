@@ -3,7 +3,8 @@ import { authenticate, loadCredentials } from "./auth";
 import { endpointFor } from "@repo/core/providers";
 import type { Inventory, RetrievalResult } from "@repo/core";
 import { storageDirectory } from "@repo/core/storage";
-import { help, parseCommand } from "./args";
+import { help } from "./args";
+import { guardHelp, prepareCommand } from "./guard";
 import { CliError } from "./errors";
 import { renderInventory, renderResult } from "./render";
 import { stat } from "node:fs/promises";
@@ -45,10 +46,10 @@ function terminalProgress() {
 
 async function main() {
   startWatchdog();
-  const command = parseCommand(process.argv.slice(2));
+  const { command, protectedPaths } = await prepareCommand(process.argv.slice(2));
   switch (command.kind) {
     case "help":
-      return write(help);
+      return write(help + guardHelp);
     case "version":
       return write(`${version}\n`);
     case "skill":
@@ -116,6 +117,7 @@ async function main() {
           root: command.root,
           includePaths: command.list,
           policy: command.policy,
+          protectedPaths,
           signal: controller.signal,
           progress: (snapshot) => progress.update(snapshot),
         });
@@ -151,6 +153,7 @@ async function main() {
             root: command.root,
             query: command.query,
             policy: command.policy,
+            protectedPaths,
             signal: controller.signal,
             progress: (snapshot) => progress.update(snapshot),
           },
